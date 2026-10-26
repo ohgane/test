@@ -3,48 +3,53 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>公開CSV fetch テスト</title>
+<title>NMR helium level monitor (JEOL500new)</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 60rem; line-height: 1.5; }
-  button { padding: .4rem 1rem; font-size: 1rem; }
-  .ok   { color: #0a7a2f; font-weight: 600; }
-  .ng   { color: #b00020; font-weight: 600; }
-  .warn { color: #8a5a00; }
-  pre   { background: #f4f4f4; padding: .8rem; overflow-x: auto; white-space: pre-wrap; }
-  table { border-collapse: collapse; margin-top: .5rem; font-size: .9rem; }
-  td, th { border: 1px solid #ccc; padding: .2rem .5rem; }
+  body { font-family: system-ui, sans-serif; margin: 1rem; max-width: 64rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 .3rem; }
+  #status { margin: .2rem 0 .6rem; color: #444; }
+  .controls { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .5rem; }
+  button { padding: .35rem .8rem; font-size: .95rem; cursor: pointer; }
+  #plot { width: 100%; height: 480px; }
+  #error { color: #b00020; font-weight: 600; }
   @media (prefers-color-scheme: dark) {
-    body { background: #181818; color: #ddd; }
-    pre { background: #262626; }
-    td, th { border-color: #555; }
-    .ok { color: #5fd38a; } .ng { color: #ff7a8a; } .warn { color: #e0b050; }
+    body { background: #181818; color: #ddd; } #status { color: #aaa; }
+    button { background: #333; color: #ddd; border: 1px solid #666; }
   }
 </style>
 </head>
 <body>
-<h1>Googleシート公開CSV:ブラウザからのfetchテスト</h1>
-<p>このページを開いた場所(<code id="origin"></code>)から、公開CSVを <code>fetch()</code> で取得できるか(CORSが許可されているか)を判定します。</p>
-<p><button id="run">再テスト</button></p>
-<div id="verdict"></div>
-<pre id="log"></pre>
-<div id="preview"></div>
+<h1>NMR helium level monitor — JEOL500new</h1>
+<div id="status">読み込み中…</div>
+<div id="error"></div>
+<div class="controls">
+  <button id="prev">◀ 1か月前へ</button>
+  <button id="next">1か月後へ ▶</button>
+  <button id="r1">直近1か月</button>
+  <button id="r3">直近3か月</button>
+  <button id="rall">全期間</button>
+</div>
+<div id="plot"></div>
 
 <script>
-// ★ HeモニターのGoogleシート公開CSV(Rmdと同じURL)
+// ===== 設定 =====
 const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRlDW4Y0mPTCUlcSVl6RPUGUif8avsftIzY-iCiKohSm2Ej-lPMFdYRx8abqZXhsUI3ZPxFnW5SXd8p/pub?gid=1835791458&single=true&output=csv";
+const MACHINE = { name: "JEOL500new", col: 5,   // 列番号(0始まり): 0 Timestamp, 1 Name, 2 JEOL400, 3 JEOL500, 4 BrukerAV, 5 JEOL500new
+                  threshold: 35, danger: 0, ymin: 0 };
+const DEFAULT_DAYS = 30;     // 初期表示:データ最終日からさかのぼる日数
+const FUTURE_DAYS  = 7;      // 右側の余白(日)
+const DAY = 86400000;
 
 const $ = id => document.getElementById(id);
-$("origin").textContent = location.origin === "null" ? "file:// (origin: null)" : location.origin;
 
-// 引用符付きフィールドに対応した最小限のCSVパーサ
+// ===== CSVパーサ(引用符対応) =====
 function parseCSV(text) {
   const rows = []; let row = [], f = "", q = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
-    if (q) {
-      if (c === '"') { if (text[i + 1] === '"') { f += '"'; i++; } else q = false; }
-      else f += c;
-    } else if (c === '"') q = true;
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { f += '"'; i++; } else q = false; } else f += c; }
+    else if (c === '"') q = true;
     else if (c === ",") { row.push(f); f = ""; }
     else if (c === "\n") { row.push(f); rows.push(row); row = []; f = ""; }
     else if (c !== "\r") f += c;
@@ -53,78 +58,96 @@ function parseCSV(text) {
   return rows;
 }
 
-// "12/30/2021 6:03:20" (m/d/Y) または "2021/12/30 6:03:20" (Y/m/d) → Date
+// "12/30/2021 6:03:20"(m/d/Y)または "2021/12/30 6:03:20"(Y/m/d)→ Date(ローカル時刻)
 function parseTimestamp(s) {
-  const m = /^(\d{1,4})\/(\d{1,2})\/(\d{1,4})/.exec(s || "");
+  const m = /^(\d{1,4})\/(\d{1,2})\/(\d{1,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/.exec((s || "").trim());
   if (!m) return null;
   const [a, b, c] = [+m[1], +m[2], +m[3]];
-  return a > 31 ? new Date(a, b - 1, c) : new Date(c, a - 1, b);
+  const [y, mo, d] = a > 31 ? [a, b, c] : [c, a, b];
+  return new Date(y, mo - 1, d, +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));
 }
 
-const fmt = d => d ? d.toISOString().slice(0, 10) : "—";
+// Date → "YYYY-MM-DD HH:MM:SS"(Plotlyに渡す文字列。タイムゾーンずれを避けるため手で整形)
+const p2 = n => String(n).padStart(2, "0");
+const toStr = d => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+// Plotlyのrange文字列 → Date(小数秒は切り捨て)
+function fromStr(s) {
+  s = String(s).replace(" ", "T").slice(0, 19);
+  if (s.length === 10) s += "T00:00:00";
+  return new Date(s);
+}
 
-async function run() {
-  $("verdict").innerHTML = ""; $("log").textContent = ""; $("preview").innerHTML = "";
-  const log = m => { $("log").textContent += m + "\n"; };
-  const url = CSV_URL + "&t=" + Date.now();   // キャッシュ回避
-  log("GET " + CSV_URL);
+let dataMin, dataMax;   // データの最古・最新
+
+function setRange(start, end) {
+  Plotly.relayout("plot", { "xaxis.range": [toStr(start), toStr(end)] });
+}
+function currentRange() {
+  const r = $("plot")._fullLayout.xaxis.range;
+  return [fromStr(r[0]), fromStr(r[1])];
+}
+function shiftMonth(dir) {                       // dir: -1(過去へ) / +1(未来へ)
+  const [s, e] = currentRange();
+  const w = e - s;
+  const ns = new Date(s.getTime() + dir * 30 * DAY);
+  setRange(ns, new Date(ns.getTime() + w));
+}
+function lastNDays(n) {
+  const end = new Date(dataMax.getTime() + FUTURE_DAYS * DAY);
+  setRange(new Date(dataMax.getTime() - n * DAY), end);
+}
+
+async function main() {
   try {
-    const t0 = performance.now();
-    const res = await fetch(url, { cache: "no-store" });
-    const dt = Math.round(performance.now() - t0);
-    log(`status: ${res.status} ${res.statusText}  (${dt} ms)`);
-    log(`redirected: ${res.redirected}`);
-    log(`final URL host: ${new URL(res.url).host}`);
-    log(`content-type: ${res.headers.get("content-type")}`);
+    const res = await fetch(CSV_URL + "&t=" + Date.now(), { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
+    const rows = parseCSV(await res.text()).slice(1);   // ヘッダ除外
 
-    const text = await res.text();
-    const rows = parseCSV(text).filter(r => r.length > 1 || (r[0] || "") !== "");
-    const header = rows[0], body = rows.slice(1);
-    log(`rows (excluding header): ${body.length}`);
-    log(`columns: ${JSON.stringify(header)}`);
-
-    const dates = body.map(r => parseTimestamp(r[0])).filter(Boolean);
-    const bad = body.length - dates.length;
-    log(`timestamp parse: ${dates.length} ok, ${bad} failed`);
-    if (dates.length) {
-      log(`date range: ${fmt(new Date(Math.min(...dates)))} → ${fmt(new Date(Math.max(...dates)))}`);
+    const pts = [];
+    for (const r of rows) {
+      const t = parseTimestamp(r[0]);
+      const v = parseFloat(r[MACHINE.col]);
+      if (t && Number.isFinite(v)) pts.push({ t, v });
     }
-    // 装置列(3列目以降)ごとの有効データ数
-    const counts = header.slice(2).map((h, i) =>
-      `${h}: ${body.filter(r => r[i + 2] !== undefined && r[i + 2].trim() !== "").length}`);
-    log("non-empty values per column (col 3+): " + counts.join(" / "));
+    if (!pts.length) throw new Error("有効なデータがありません(列番号 " + MACHINE.col + " を確認)");
+    pts.sort((a, b) => a.t - b.t);
+    dataMin = pts[0].t; dataMax = pts[pts.length - 1].t;
 
-    // 末尾5行のプレビュー
-    const last = body.slice(-5);
-    let html = "<h3>末尾5行</h3><table><tr>" + header.map(h => `<th>${h}</th>`).join("") + "</tr>";
-    for (const r of last) html += "<tr>" + header.map((_, i) => `<td>${(r[i] ?? "")}</td>`).join("") + "</tr>";
-    $("preview").innerHTML = html + "</table>";
+    const last = pts[pts.length - 1];
+    $("status").textContent = `最新: ${last.v}%(${toStr(last.t).slice(0, 16)})/ 全${pts.length}点(${toStr(dataMin).slice(0, 10)} 〜)`;
 
-    $("verdict").innerHTML = '<p class="ok">✔ 成功:このオリジンからfetchでき、CSVを取得・パースできました(CORS許可)。</p>';
+    const x = pts.map(p => toStr(p.t)), y = pts.map(p => p.v);
+    const end0 = new Date(dataMax.getTime() + FUTURE_DAYS * DAY);
+    const start0 = new Date(dataMax.getTime() - DEFAULT_DAYS * DAY);
+
+    const trace = { x, y, mode: "markers", type: "scatter", marker: { size: 8, color: "#1f77b4" },
+                    hovertemplate: "%{x|%Y-%m-%d %H:%M}<br>%{y}%<extra></extra>" };
+    const hline = (yv, color) => ({ type: "line", xref: "paper", x0: 0, x1: 1, yref: "y", y0: yv, y1: yv,
+                                    line: { color, width: 1.5 } });
+    const layout = {
+      title: { text: MACHINE.name },
+      xaxis: { type: "date", range: [toStr(start0), toStr(end0)], tickformat: "%y/%b/%d", tickangle: -90,
+               dtick: 7 * DAY, showgrid: true },
+      yaxis: { title: { text: "Helium level (%)" }, range: [MACHINE.ymin, 105], fixedrange: true },
+      shapes: [hline(MACHINE.threshold, "#222"), hline(MACHINE.danger, "red"),
+               { type: "line", yref: "paper", y0: 0, y1: 1, xref: "x", x0: toStr(new Date()), x1: toStr(new Date()),
+                 line: { color: "#888", width: 1, dash: "dot" } }],     // 今日
+      dragmode: "pan", margin: { t: 50, r: 20, b: 90, l: 60 }, showlegend: false
+    };
+    await Plotly.newPlot("plot", [trace], layout, { responsive: true, displaylogo: false, scrollZoom: false,
+                                                    modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d"] });
+
+    $("prev").onclick = () => shiftMonth(-1);
+    $("next").onclick = () => shiftMonth(+1);
+    $("r1").onclick = () => lastNDays(30);
+    $("r3").onclick = () => lastNDays(90);
+    $("rall").onclick = () => setRange(new Date(dataMin.getTime() - 3 * DAY), end0);
   } catch (e) {
-    log(`error: ${e.name}: ${e.message}`);
-    // 切り分け: no-cors モードはCORSに関係なく「届いたか」だけ分かる(中身は読めない=opaque)
-    let probe;
-    try {
-      const r2 = await fetch(CSV_URL + "&t=" + Date.now(), { mode: "no-cors", cache: "no-store" });
-      probe = `no-cors probe: 到達OK (type=${r2.type}) → サーバーには届いている`;
-      log(probe);
-      $("verdict").innerHTML =
-        '<p class="ng">✘ 通常のfetchは失敗、no-corsは到達:原因はCORS(応答を読むことをブラウザが禁止)と判断できます。</p>' +
-        '<p class="warn">ただし file:// で開いている場合は、file://起因の制限の可能性も残ります。' +
-        '同じ結果をGitHub Pages等のhttps環境でも確認してください。</p>';
-    } catch (e2) {
-      log(`no-cors probe: 失敗 (${e2.name}: ${e2.message}) → ネットワーク/ブラウザ設定側の問題の可能性`);
-      $("verdict").innerHTML =
-        '<p class="ng">✘ no-corsでも失敗:CORS以前に、通信自体がブロックされている可能性があります。</p>' +
-        '<p class="warn">広告・トラッキングブロッカー、VPN、セキュリティソフト、file://の制限を確認してください。' +
-        '拡張機能を無効にしたウィンドウ(Safariならプライベートウィンドウ)で再試験を。</p>';
-    }
+    $("status").textContent = "";
+    $("error").textContent = "データを取得できませんでした: " + e.message;
   }
 }
-$("run").addEventListener("click", run);
-run();
+main();
 </script>
 </body>
 </html>
